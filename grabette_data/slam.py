@@ -94,6 +94,9 @@ def _build_docker_cmd(
     output_gravity: str | None = None,
     output_biases: str | None = None,
     max_lost_frames: int = -1,
+    deterministic: bool = False,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
 ) -> tuple[list[str], str]:
     """Build the docker run command list. Returns (cmd, container_name)."""
@@ -142,6 +145,11 @@ def _build_docker_cmd(
         cmd.extend(["--output_biases", f"{data_mount}/{output_biases}"])
     if max_lost_frames > 0:
         cmd.extend(["--max_lost_frames", str(max_lost_frames)])
+    if deterministic:
+        cmd.append("--deterministic")
+    if max_lost_pct > 0:
+        cmd.extend(["--max_lost_pct", str(max_lost_pct)])
+        cmd.extend(["--warmup_frames", str(warmup_frames)])
 
     return cmd, container_name
 
@@ -196,6 +204,9 @@ def run_slam(
     output_biases: str | None = None,
     mask: bool = True,
     max_lost_frames: int = -1,
+    deterministic: bool = False,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
     timeout_s: float | None = None,
@@ -241,6 +252,9 @@ def run_slam(
         output_gravity=output_gravity,
         output_biases=output_biases,
         max_lost_frames=max_lost_frames,
+        deterministic=deterministic,
+        max_lost_pct=max_lost_pct,
+        warmup_frames=warmup_frames,
         docker_image=docker_image,
     )
 
@@ -316,6 +330,9 @@ def _run_attempt(
     *,
     docker_image: str,
     settings_path: Path,
+    deterministic: bool = False,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
     show_progress: bool = True,
 ) -> tuple[int, SlamResult]:
     """Run a single pass-1 mapping attempt. Returns (attempt_number, result)."""
@@ -325,6 +342,9 @@ def _run_attempt(
         save_map=map_dir / f"map_atlas_attempt{attempt}.osa",
         output_gravity=f"gravity_attempt{attempt}.csv",
         output_biases=f"biases_attempt{attempt}.csv",
+        deterministic=deterministic,
+        max_lost_pct=max_lost_pct,
+        warmup_frames=warmup_frames,
         docker_image=docker_image,
         settings_path=settings_path,
         log_prefix=f"slam_attempt{attempt}",
@@ -338,6 +358,9 @@ def create_map(
     *,
     retries: int = 3,
     parallel: int = 1,
+    deterministic: bool = False,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ) -> Path:
@@ -346,10 +369,16 @@ def create_map(
     Pass 1 runs 1+retries attempts (sequentially or in parallel), keeps best by
     tracking rate. Pass 2 re-localizes against the best map.
 
+    When deterministic=True, forces retries=0 and parallel=1 (single
+    deterministic pass — no retries needed since results are reproducible).
+
     Args:
         video_dir: directory containing raw_video.mp4 and imu_data.json
         retries: number of extra attempts for pass 1 (total = 1 + retries)
         parallel: number of pass-1 attempts to run simultaneously
+        deterministic: run in deterministic mode (slower, reproducible)
+        max_lost_pct: abort attempt if lost rate exceeds this after warmup (-1=disabled)
+        warmup_frames: frames before checking lost rate
         docker_image: Docker image name
         settings_path: SLAM settings YAML path
 
@@ -360,6 +389,11 @@ def create_map(
     map_dir = video_dir / "map"
     map_dir.mkdir(exist_ok=True)
     map_path = map_dir / "map_atlas.osa"
+
+    # Deterministic mode: single pass, no retries needed
+    if deterministic:
+        retries = 0
+        parallel = 1
 
     total_attempts = 1 + retries
 
@@ -373,12 +407,15 @@ def create_map(
         results = _pass1_sequential(
             video_dir, map_dir, total_attempts,
             docker_image=docker_image, settings_path=settings_path,
+            deterministic=deterministic,
+            max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
         )
     else:
         # Parallel mode: launch all attempts at once
         results = _pass1_parallel(
             video_dir, map_dir, total_attempts, parallel,
             docker_image=docker_image, settings_path=settings_path,
+            max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
         )
 
     # Pick the best attempt
@@ -454,6 +491,9 @@ def _pass1_sequential(
     *,
     docker_image: str,
     settings_path: Path,
+    deterministic: bool = False,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
 ) -> list[tuple[int, SlamResult]]:
     """Run pass-1 attempts sequentially with progress bars. Early-stops at >=90%."""
     results = []
@@ -466,6 +506,8 @@ def _pass1_sequential(
         attempt_num, result = _run_attempt(
             attempt, video_dir, map_dir,
             docker_image=docker_image, settings_path=settings_path,
+            deterministic=deterministic,
+            max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
             show_progress=True,
         )
         results.append((attempt_num, result))
@@ -493,6 +535,8 @@ def _pass1_parallel(
     *,
     docker_image: str,
     settings_path: Path,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
 ) -> list[tuple[int, SlamResult]]:
     """Run pass-1 attempts in parallel (no per-attempt progress bars)."""
     n_workers = min(parallel, total_attempts)
@@ -506,6 +550,7 @@ def _pass1_parallel(
                 _run_attempt,
                 attempt, video_dir, map_dir,
                 docker_image=docker_image, settings_path=settings_path,
+                max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
                 show_progress=False,
             )
             futures[fut] = attempt
@@ -551,6 +596,7 @@ def batch_slam(
     num_workers: int | None = None,
     max_lost_frames: int = 60,
     timeout_multiple: float = 16,
+    deterministic: bool = False,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     settings_path: Path = DEFAULT_SETTINGS,
 ):
@@ -598,6 +644,7 @@ def batch_slam(
             load_map=map_path,
             mask=True,
             max_lost_frames=max_lost_frames,
+            deterministic=deterministic,
             docker_image=docker_image,
         )
         jobs.append((cmd, vdir, timeout))

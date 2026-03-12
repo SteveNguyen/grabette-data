@@ -20,8 +20,10 @@ from grabette_data.slam import batch_slam, DEFAULT_DOCKER_IMAGE, DEFAULT_SETTING
               help="timeout = video_duration * this")
 @click.option("-d", "--docker_image", default=DEFAULT_DOCKER_IMAGE)
 @click.option("-s", "--settings", default=str(DEFAULT_SETTINGS), type=click.Path(exists=True))
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Run in deterministic mode (slower, reproducible)")
 def main(input_dir, map_path, num_workers, max_lost_frames, timeout_multiple,
-         docker_image, settings):
+         docker_image, settings, deterministic):
     input_dir = Path(input_dir).expanduser().absolute()
 
     # Find all episode directories with raw_video.mp4
@@ -39,6 +41,7 @@ def main(input_dir, map_path, num_workers, max_lost_frames, timeout_multiple,
         num_workers=num_workers,
         max_lost_frames=max_lost_frames,
         timeout_multiple=timeout_multiple,
+        deterministic=deterministic,
         docker_image=docker_image,
         settings_path=Path(settings),
     )

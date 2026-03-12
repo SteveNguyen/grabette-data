@@ -18,7 +18,14 @@ from grabette_data.slam import create_map, DEFAULT_DOCKER_IMAGE, DEFAULT_SETTING
               help="Docker image name")
 @click.option("-s", "--settings", default=str(DEFAULT_SETTINGS), type=click.Path(exists=True),
               help="SLAM settings YAML")
-def main(input_dir, retries, parallel, docker_image, settings):
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Run in deterministic mode (slower, reproducible)")
+@click.option("--max_lost_pct", type=float, default=-1,
+              help="Max lost frame %% before early abort (-1=disabled)")
+@click.option("--warmup_frames", type=int, default=300,
+              help="Frames before checking lost rate")
+def main(input_dir, retries, parallel, docker_image, settings,
+         deterministic, max_lost_pct, warmup_frames):
     video_dir = Path(input_dir).expanduser().absolute()
     for fn in ["raw_video.mp4", "imu_data.json"]:
         if not (video_dir / fn).is_file():
@@ -28,6 +35,9 @@ def main(input_dir, retries, parallel, docker_image, settings):
         video_dir,
         retries=retries,
         parallel=parallel,
+        deterministic=deterministic,
+        max_lost_pct=max_lost_pct,
+        warmup_frames=warmup_frames,
         docker_image=docker_image,
         settings_path=Path(settings),
     )
