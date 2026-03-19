@@ -146,6 +146,35 @@ uv run python scripts/visualize_trajectory.py ~/data/episodes/mapping_session
 uv run python scripts/visualize_trajectory.py ~/data/episodes/mapping_session --video-skip 1
 ```
 
+## Gradio Space (browser UI)
+
+A Gradio app wraps the pipeline steps (SLAM, dataset generation) in a browser interface,
+running ORB-SLAM3 natively without Docker-in-Docker.
+
+### Run locally with Docker
+
+```bash
+# Build (first time: ~10 min — pulls base image, installs Python + deps)
+docker build -f space/Dockerfile -t grabette-space .
+
+# Run
+docker run --rm -p 7860:7860 grabette-space
+```
+
+Open **http://localhost:7860**.
+
+The Dockerfile is built from the repo root so all package files are available in the build context.
+The SLAM binary path and settings are configured automatically via environment variables set in the Dockerfile.
+
+### Project structure
+
+```
+space/
+├── README.md      # Hugging Face Space metadata (YAML frontmatter)
+├── Dockerfile     # Extends pollenrobotics/orbslam3-headless, adds Python + Gradio
+└── app.py         # Gradio UI (3 tabs: Create Map, Batch SLAM, Generate Dataset)
+```
+
 ## Project structure
 
 ```

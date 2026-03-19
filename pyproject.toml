@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy",
     "scipy",
-    "opencv-python",
+    "opencv-python-headless",
     "av",
     "click",
     "pandas",

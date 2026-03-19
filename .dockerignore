@@ -1,0 +1,6 @@
+grabette_env/
+uv.lock
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/

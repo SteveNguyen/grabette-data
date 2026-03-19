@@ -2,6 +2,9 @@
 
 Runs grabette_slam inside Docker for mapping (pass 1 + pass 2) and
 batch localization against an existing map.
+
+Native mode: set GRABETTE_SLAM_BINARY to the grabette_slam executable path
+to call it directly without Docker (used in the HF Space).
 """
 
 import concurrent.futures
@@ -27,9 +30,17 @@ from grabette_data.mask import generate_mask
 # Default Docker image name (local build, no hub pull)
 DEFAULT_DOCKER_IMAGE = "pollenrobotics/orbslam3-headless"
 
-# Default SLAM settings — shipped with this package
+# Default SLAM settings — shipped with this package.
+# Can be overridden via GRABETTE_SLAM_SETTINGS env var (used in the HF Space).
 _PACKAGE_DIR = Path(__file__).parent
-DEFAULT_SETTINGS = _PACKAGE_DIR.parent / "config" / "rpi_bmi088_slam_settings.yaml"
+_default_settings = _PACKAGE_DIR.parent / "config" / "rpi_bmi088_slam_settings.yaml"
+DEFAULT_SETTINGS = Path(os.environ.get("GRABETTE_SLAM_SETTINGS", str(_default_settings)))
+
+# Native mode: skip Docker, invoke the binary directly.
+# Activated by setting GRABETTE_SLAM_BINARY in the environment.
+_ORBSLAM3_DIR = Path(os.environ.get("ORBSLAM3_DIR", "/ORB_SLAM3"))
+DEFAULT_VOCABULARY = _ORBSLAM3_DIR / "Vocabulary" / "ORBvoc.txt"
+_ENV_SLAM_BINARY: str | None = os.environ.get("GRABETTE_SLAM_BINARY")
 
 
 @dataclass
@@ -154,6 +165,53 @@ def _build_docker_cmd(
     return cmd, container_name
 
 
+def _build_native_cmd(
+    video_dir: Path,
+    *,
+    imu_filename: str,
+    output_csv: str,
+    settings_path: Path,
+    save_map: Path | None = None,
+    load_map: Path | None = None,
+    mask: bool = True,
+    output_gravity: str | None = None,
+    output_biases: str | None = None,
+    max_lost_frames: int = -1,
+    deterministic: bool = False,
+    max_lost_pct: float = -1,
+    warmup_frames: int = 300,
+    slam_binary: Path = Path("/ORB_SLAM3/Examples/Monocular-Inertial/grabette_slam"),
+    vocabulary: Path = DEFAULT_VOCABULARY,
+) -> list[str]:
+    """Build the native (non-Docker) SLAM command using actual file paths."""
+    cmd = [
+        str(slam_binary),
+        "--vocabulary", str(vocabulary),
+        "--setting", str(settings_path),
+        "--input_video", str(video_dir / "raw_video.mp4"),
+        "--input_imu_json", str(video_dir / imu_filename),
+        "--output_trajectory_csv", str(video_dir / output_csv),
+    ]
+    if save_map is not None:
+        cmd.extend(["--save_map", str(save_map)])
+    if load_map is not None:
+        cmd.extend(["--load_map", str(load_map)])
+    if mask:
+        cmd.extend(["--mask_img", str(video_dir / "slam_mask.png")])
+    if output_gravity:
+        cmd.extend(["--output_gravity", str(video_dir / output_gravity)])
+    if output_biases:
+        cmd.extend(["--output_biases", str(video_dir / output_biases)])
+    if max_lost_frames > 0:
+        cmd.extend(["--max_lost_frames", str(max_lost_frames)])
+    if deterministic:
+        cmd.append("--deterministic")
+    if max_lost_pct > 0:
+        cmd.extend(["--max_lost_pct", str(max_lost_pct)])
+        cmd.extend(["--warmup_frames", str(warmup_frames)])
+    return cmd
+
+
 def _read_slam_pipe(pipe, stdout_path: Path, show_progress: bool):
     """Reader thread: drain pipe line-by-line, write to log, optionally show progress."""
     pbar = None
@@ -208,12 +266,13 @@ def run_slam(
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
+    slam_binary: Path | None = None,
     settings_path: Path = DEFAULT_SETTINGS,
     timeout_s: float | None = None,
     log_prefix: str = "slam",
     show_progress: bool = True,
 ) -> SlamResult:
-    """Run grabette_slam in Docker on a single video directory.
+    """Run grabette_slam on a single video directory.
 
     Args:
         video_dir: directory containing raw_video.mp4 and imu_data.json
@@ -224,7 +283,9 @@ def run_slam(
         output_biases: biases output filename (inside video_dir), or None
         mask: generate and apply device mask
         max_lost_frames: terminate after N lost frames (-1 = disabled)
-        docker_image: Docker image name
+        docker_image: Docker image name (ignored in native mode)
+        slam_binary: path to grabette_slam binary for native mode; falls back
+            to GRABETTE_SLAM_BINARY env var; if neither is set, uses Docker
         settings_path: SLAM settings YAML path
         timeout_s: subprocess timeout in seconds
         log_prefix: prefix for stdout/stderr log files
@@ -236,27 +297,51 @@ def run_slam(
     video_dir = Path(video_dir).absolute()
     settings_path = Path(settings_path).absolute()
 
+    # Native mode: use binary directly if slam_binary is set or env var is present
+    if slam_binary is None and _ENV_SLAM_BINARY:
+        slam_binary = Path(_ENV_SLAM_BINARY)
+    native = slam_binary is not None
+
     # Ensure prerequisites
     imu_filename = _ensure_imu_resampled(video_dir)
     if mask:
         _ensure_mask(video_dir, video_dir / "raw_video.mp4")
 
-    cmd, container_name = _build_docker_cmd(
-        video_dir,
-        imu_filename=imu_filename,
-        output_csv=output_csv,
-        settings_path=settings_path,
-        save_map=save_map,
-        load_map=load_map,
-        mask=mask,
-        output_gravity=output_gravity,
-        output_biases=output_biases,
-        max_lost_frames=max_lost_frames,
-        deterministic=deterministic,
-        max_lost_pct=max_lost_pct,
-        warmup_frames=warmup_frames,
-        docker_image=docker_image,
-    )
+    if native:
+        cmd = _build_native_cmd(
+            video_dir,
+            imu_filename=imu_filename,
+            output_csv=output_csv,
+            settings_path=settings_path,
+            save_map=save_map,
+            load_map=load_map,
+            mask=mask,
+            output_gravity=output_gravity,
+            output_biases=output_biases,
+            max_lost_frames=max_lost_frames,
+            deterministic=deterministic,
+            max_lost_pct=max_lost_pct,
+            warmup_frames=warmup_frames,
+            slam_binary=slam_binary,
+        )
+        container_name = None
+    else:
+        cmd, container_name = _build_docker_cmd(
+            video_dir,
+            imu_filename=imu_filename,
+            output_csv=output_csv,
+            settings_path=settings_path,
+            save_map=save_map,
+            load_map=load_map,
+            mask=mask,
+            output_gravity=output_gravity,
+            output_biases=output_biases,
+            max_lost_frames=max_lost_frames,
+            deterministic=deterministic,
+            max_lost_pct=max_lost_pct,
+            warmup_frames=warmup_frames,
+            docker_image=docker_image,
+        )
 
     stdout_path = video_dir / f"{log_prefix}_stdout.txt"
     stderr_path = video_dir / f"{log_prefix}_stderr.txt"
@@ -287,11 +372,14 @@ def run_slam(
                 proc.wait(timeout=timeout_s)
                 returncode = proc.returncode
             except subprocess.TimeoutExpired:
-                # Kill the Docker container directly (more reliable than killing docker CLI)
-                subprocess.run(
-                    ["docker", "kill", container_name],
-                    capture_output=True, timeout=10,
-                )
+                if native:
+                    proc.kill()
+                else:
+                    # Kill the Docker container directly (more reliable than killing docker CLI)
+                    subprocess.run(
+                        ["docker", "kill", container_name],
+                        capture_output=True, timeout=10,
+                    )
                 proc.wait(timeout=10)
                 print(f"\n  SLAM timed out after {timeout_s:.0f}s")
                 returncode = -1
@@ -330,6 +418,7 @@ def _run_attempt(
     *,
     docker_image: str,
     settings_path: Path,
+    slam_binary: Path | None = None,
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
@@ -346,6 +435,7 @@ def _run_attempt(
         max_lost_pct=max_lost_pct,
         warmup_frames=warmup_frames,
         docker_image=docker_image,
+        slam_binary=slam_binary,
         settings_path=settings_path,
         log_prefix=f"slam_attempt{attempt}",
         show_progress=show_progress,
@@ -362,6 +452,7 @@ def create_map(
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
+    slam_binary: Path | None = None,
     settings_path: Path = DEFAULT_SETTINGS,
 ) -> Path:
     """Two-pass mapping: pass 1 (save_map + gravity/biases), pass 2 (load_map).
@@ -379,7 +470,8 @@ def create_map(
         deterministic: run in deterministic mode (slower, reproducible)
         max_lost_pct: abort attempt if lost rate exceeds this after warmup (-1=disabled)
         warmup_frames: frames before checking lost rate
-        docker_image: Docker image name
+        docker_image: Docker image name (ignored in native mode)
+        slam_binary: path to grabette_slam binary for native mode (see run_slam)
         settings_path: SLAM settings YAML path
 
     Returns:
@@ -407,6 +499,7 @@ def create_map(
         results = _pass1_sequential(
             video_dir, map_dir, total_attempts,
             docker_image=docker_image, settings_path=settings_path,
+            slam_binary=slam_binary,
             deterministic=deterministic,
             max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
         )
@@ -415,6 +508,7 @@ def create_map(
         results = _pass1_parallel(
             video_dir, map_dir, total_attempts, parallel,
             docker_image=docker_image, settings_path=settings_path,
+            slam_binary=slam_binary,
             max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
         )
 
@@ -460,6 +554,7 @@ def create_map(
         output_csv="mapping_camera_trajectory_pass2.csv",
         load_map=map_path,
         docker_image=docker_image,
+        slam_binary=slam_binary,
         settings_path=settings_path,
         timeout_s=pass2_timeout,
         log_prefix="slam_pass2",
@@ -496,6 +591,7 @@ def _pass1_sequential(
     *,
     docker_image: str,
     settings_path: Path,
+    slam_binary: Path | None = None,
     deterministic: bool = False,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
@@ -511,6 +607,7 @@ def _pass1_sequential(
         attempt_num, result = _run_attempt(
             attempt, video_dir, map_dir,
             docker_image=docker_image, settings_path=settings_path,
+            slam_binary=slam_binary,
             deterministic=deterministic,
             max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
             show_progress=True,
@@ -540,6 +637,7 @@ def _pass1_parallel(
     *,
     docker_image: str,
     settings_path: Path,
+    slam_binary: Path | None = None,
     max_lost_pct: float = -1,
     warmup_frames: int = 300,
 ) -> list[tuple[int, SlamResult]]:
@@ -555,6 +653,7 @@ def _pass1_parallel(
                 _run_attempt,
                 attempt, video_dir, map_dir,
                 docker_image=docker_image, settings_path=settings_path,
+                slam_binary=slam_binary,
                 max_lost_pct=max_lost_pct, warmup_frames=warmup_frames,
                 show_progress=False,
             )
@@ -603,6 +702,7 @@ def batch_slam(
     timeout_multiple: float = 16,
     deterministic: bool = False,
     docker_image: str = DEFAULT_DOCKER_IMAGE,
+    slam_binary: Path | None = None,
     settings_path: Path = DEFAULT_SETTINGS,
 ):
     """Localize multiple videos against a shared map.
@@ -610,10 +710,11 @@ def batch_slam(
     Args:
         video_dirs: list of directories, each with raw_video.mp4 + imu_data.json
         map_path: path to map_atlas.osa
-        num_workers: parallel Docker containers (default: cpu_count // 2)
+        num_workers: parallel workers (default: cpu_count // 2)
         max_lost_frames: terminate individual runs after N lost frames
         timeout_multiple: timeout = video_duration * this
-        docker_image: Docker image name
+        docker_image: Docker image name (ignored in native mode)
+        slam_binary: path to grabette_slam binary for native mode (see run_slam)
         settings_path: SLAM settings YAML path
     """
     map_path = Path(map_path).absolute()
@@ -641,17 +742,32 @@ def batch_slam(
             duration = float(stream.duration * stream.time_base)
         timeout = duration * timeout_multiple
 
-        cmd, _ = _build_docker_cmd(
-            vdir,
-            imu_filename=imu_filename,
-            output_csv="camera_trajectory.csv",
-            settings_path=settings_path,
-            load_map=map_path,
-            mask=True,
-            max_lost_frames=max_lost_frames,
-            deterministic=deterministic,
-            docker_image=docker_image,
-        )
+        _native = slam_binary is not None or bool(_ENV_SLAM_BINARY)
+        _bin = slam_binary or (Path(_ENV_SLAM_BINARY) if _ENV_SLAM_BINARY else None)
+        if _native:
+            cmd = _build_native_cmd(
+                vdir,
+                imu_filename=imu_filename,
+                output_csv="camera_trajectory.csv",
+                settings_path=settings_path,
+                load_map=map_path,
+                mask=True,
+                max_lost_frames=max_lost_frames,
+                deterministic=deterministic,
+                slam_binary=_bin,
+            )
+        else:
+            cmd, _ = _build_docker_cmd(
+                vdir,
+                imu_filename=imu_filename,
+                output_csv="camera_trajectory.csv",
+                settings_path=settings_path,
+                load_map=map_path,
+                mask=True,
+                max_lost_frames=max_lost_frames,
+                deterministic=deterministic,
+                docker_image=docker_image,
+            )
         jobs.append((cmd, vdir, timeout))
 
     print(f"Running {len(jobs)} SLAM jobs with {num_workers} workers...")
